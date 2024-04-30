@@ -699,6 +699,8 @@ inline Eigen::Vector2d get_v(const alma::Gamma_grid&  grid,
 
 ///Particle evolution:
 ///@param[in,out] particle - deviational particle to evolve
+///@param[in] grids - grid data for all materials
+///@param[in] cells - cell data for all materials
 ///@param[in] v        - particle velocity
 ///@param[in] sys      - geometry and box info
 ///@param[in] dt       - time to evolve
@@ -707,6 +709,8 @@ inline Eigen::Vector2d get_v(const alma::Gamma_grid&  grid,
 ///@param[in] Novoid  - flag to print info
 template <class Random,class Mutex>
 void evolparticle(alma::D_particle& particle,
+                  gridData& grids,
+                  cellData& cells,
                   Eigen::Vector2d& v,
                   std::vector<alma::geometry_2d>& sys,
                   double dt,
@@ -714,6 +718,19 @@ void evolparticle(alma::D_particle& particle,
                   Mutex& pmutex){
     ///particle mutex
     ///to make function thread safe
+    
+    /// Make some v check
+    //for (auto iv : {0, 1}) {
+        //if (alma::almost_equal(v(iv), 0.) and v(iv) != 0.) {
+            //throw alma::geometry_error(
+                //"Error, please set all that"
+                //" evaluates almost_equal to 0 as 0. Otherwise,"
+                //" geometric algorithms will fail\n"
+                //"Specifically the rnew check as it contains "
+                //"v in spatial search of boxes to go\n");
+        //}
+    //}
+    
     ///Save original vector
     Eigen::Vector2d opos(particle.pos);
     
@@ -724,6 +741,8 @@ void evolparticle(alma::D_particle& particle,
         particle.alpha = 0;
         return;
     }
+
+    auto mat = sys[particle.boxid].material;
     
     ///Apply PBC
     if (sys[particle.boxid].periodic) {
@@ -769,16 +788,25 @@ void evolparticle(alma::D_particle& particle,
         std::vector<int>> MRU_sol; 
     
     try {
+        //pmutex.lock();
         MRU_sol = 
         sys[particle.boxid].get_inter_side(rp,v,dt);
+        //pmutex.unlock();
+        //std::cout <<  "OK - MRU_sol O" <<  std::get<0>(MRU_sol) <<  "MRU_sol 1"<< std::get<1>(MRU_sol) << " dt=" << dt <<std::endl;
     }
     catch (const alma::geometry_error& geomerror) {
+       //pmutex.lock();
+       //std::cout <<  "error - MRU_sol" << std::get<1>(MRU_sol) << " dt=" << dt <<std::endl;
+       //pmutex.unlock();
        Eigen::Vector2d d = 
             sys[particle.boxid].get_center() -
             opos;
        particle.pos += 1.0e-6*d/d.norm();
-       evolparticle(particle,v,sys,
-                    dt,rnd,pmutex);
+    
+       //comment this, since it is commented also in RTA_MC2D.cpp
+       //evolparticle(particle,grids,cells,v,sys,
+       //             dt,rnd,pmutex);
+
        return;
     }
     
@@ -816,7 +844,6 @@ void evolparticle(alma::D_particle& particle,
         bool parallel = alma::almost_equal((border_contact[0].np).dot(v),0.);
         
         bool oriented = ((border_contact[0].np).dot(v) > 0.);
-        
         if ((sys[test].inside(rnew) or sys[test].inside(reps) )
              and !parallel and oriented) {
             pboxes.push_back(test);
@@ -839,16 +866,114 @@ void evolparticle(alma::D_particle& particle,
                         corner_problem.second,
                         rnd);
             //pmutex.unlock();
+            Eigen::Vector2d correction =
+                sys[particle.boxid].get_center() - rnew;
+            Eigen::Vector2d corrected_pos =
+                rnew + 1.0e-6 * correction / correction.norm();
+
+            MRU_sol =
+                sys[particle.boxid].get_inter_side(corrected_pos, v, 1.0e+18);
+
+            rnew = std::get<1>(MRU_sol);
+
             particle.boxid = csol.first;
             particle.pos = rnew;
             
-            
-            sys[particle.boxid].add_border_Eborder(csol.second,
-                            static_cast<int>(particle.sign));
-            
+            //Diffusive scattering
+            //from 846-851, comment to get rid of diffusive boundary
+            //sys[particle.boxid].add_border_Eborder(csol.second,
+            //                static_cast<int>(particle.sign));
             ///Set to be deleted
-            particle.q = 0;
-            particle.alpha = 0;
+            //particle.q = 0;
+            //particle.alpha = 0;
+
+            std::size_t iborder;
+            auto iborders = std::get<2>(MRU_sol);
+            if (iborders.size() > 1) {
+                /// We first check the borders
+                /// that touch void
+                std::vector<std::size_t> voidborders;
+                for (auto& tvb : iborders) {
+                    auto& mb = sys[particle.boxid].get_border(tvb);
+                    Eigen::Vector2d rc = rnew + 1.0e-4 * mb.np;
+                    bool isvoid = true;
+                    for (auto& cb : cboxes) {
+                        if (sys[cb].inside(rc)) {
+                            isvoid = false;
+                            break;
+                        }
+                    }
+                    if (isvoid) {
+                        voidborders.push_back(tvb);
+                    }
+                }
+                if (voidborders.empty()) {
+                    throw alma::geometry_error("Error in void borders\n");
+                }
+                // In the case two borders pointing at void
+                iborder = voidborders[std::uniform_int_distribution(
+                    0, static_cast<int>(voidborders.size()))(rnd)];
+            }
+            else {
+                iborder = iborders[0];
+            }
+
+            //Specular scattering 
+            Eigen::Vector3d q_old = (*(grids[mat])).get_q(particle.q);
+	        // Get \hat{e}_{in}
+            Eigen::Vector3d nwall;
+            nwall << -sys[particle.boxid].get_border(iborder).np(0), -sys[particle.boxid].get_border(iborder).np(1), 0;
+            // Reflection
+            Eigen::Vector3d q_new = q_old - 2.0 * q_old.dot(nwall) * nwall;
+            // Now go to crystal coordinates
+            Eigen::Matrix3d temp_result;
+            temp_result = (*(grids[mat])).rlattvec.inverse();
+            q_new = temp_result * q_new;
+            // Obtain the iq id
+            // here we use round to ensure that q_new belongs to the mesh
+            // for super dense meshes this is exact                    
+            q_new -= q_new.array().round().matrix().eval();                     
+            int idx_a = std::round(q_new[0] * (*(grids[mat])).na);
+            int idx_b = std::round(q_new[1] * (*(grids[mat])).nb);
+            int idx_c = std::round(q_new[2] * (*(grids[mat])).nc);
+            //
+            particle.q =(*(grids[mat])).three_to_one({idx_a, idx_b, idx_c});
+            if (not (particle.q == 0 and particle.alpha == 0)){
+                /// Check if arrived to reservoir
+                /// In that case terminate with that particle
+                /// Inspired by RTA MC 2D    
+                auto spectrum = (*(grids[mat])).get_spectrum_at_q(particle.q);
+                auto my_omega = spectrum.omega(particle.alpha);
+                auto new_v = get_v(*(grids[mat]), particle.alpha, particle.q);
+                // Sometimes when we are with degeneracies the state to bounce is the
+                // other degenerate band - this should take care of this
+                //
+                bool good = spectrum.vg.col(particle.alpha).matrix().dot(nwall) > 0.0;
+                //
+                if (! good ) {
+                    for (std::size_t i = 0; i < spectrum.omega.size(); i++) {
+                        if (i != particle.alpha and alma::almost_equal(my_omega,spectrum.omega(i))) {
+                            if (spectrum.vg.col(i).matrix().dot(nwall) > 0.0) {
+                                particle.alpha = i;
+                                new_v = get_v(*(grids[mat]), particle.alpha, particle.q);
+                                good= true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (good){
+                    v=new_v;
+                    // Recursive call
+                    evolparticle(particle,grids,cells,v,sys,
+                        left_time,rnd,pmutex);
+                }
+                else{
+                    //set to be deleted
+                    particle.q=0;
+                    particle.alpha=0;
+                }    
+            }
         }
         else {
             std::size_t iborder;
@@ -891,11 +1016,81 @@ void evolparticle(alma::D_particle& particle,
                 iborder = iborders[0];
             }
 
-            sys[particle.boxid].add_border_Eborder(iborder,
-                            static_cast<int>(particle.sign));
-            ///Set to be deleted
-            particle.q = 0;
-            particle.alpha = 0;
+            // commented to get rid of the diffusive boundary
+            //sys[particle.boxid].add_border_Eborder(iborder,
+            //                static_cast<int>(particle.sign));
+            /////Set to be deleted
+            //particle.q = 0;
+            //particle.alpha = 0;
+            //
+            //
+            //
+            // specular reflection
+            // Get current point
+            Eigen::Vector3d q_old = (*(grids[mat])).get_q(particle.q);
+            //Eigen::Vector3d q_old((*(grids[mat])).get_q(particle.q).data());
+            // --------------------------------------------------------
+            // this line is different from the one suggested originally, which was 
+            // Eigen::Map<Eigen::Vector3d> q_old(grid.get_q(particle.q).data());
+            // the original line did not work, the code crashed after the first time step
+            // the line above works better (the code creates ~600 MB data output before crashing)
+            // --------------------------------------------------------
+	        // Get \hat{e}_{in}
+            Eigen::Vector3d nwall;
+            nwall << -sys[particle.boxid].get_border(iborder).np(0), -sys[particle.boxid].get_border(iborder).np(1), 0;
+            // Reflection
+            Eigen::Vector3d q_new = q_old - 2.0 * q_old.dot(nwall) * nwall;
+            // Now go to crystal coordinates
+            // Create a temporary variable to hold the result
+            Eigen::Matrix3d temp_result = (*(grids[mat])).rlattvec.inverse();
+            // Assign the temporary variable to q_new
+            q_new = temp_result * q_new;
+            //
+            // Obtain the iq id
+            //here we use round to ensure that q_new belongs to the mesh
+            // for super dense meshes this is exact                    
+            q_new -= q_new.array().round().matrix().eval();                     
+            int idx_a = std::round(q_new[0] * (*(grids[mat])).na);
+            int idx_b = std::round(q_new[1] * (*(grids[mat])).nb);
+            int idx_c = std::round(q_new[2] * (*(grids[mat])).nc);
+            //
+            particle.q =(*(grids[mat])).three_to_one({idx_a, idx_b, idx_c});
+            if (not (particle.q == 0 and particle.alpha == 0)){
+                /// Check if arrived to reservoir
+                /// In that case terminate with that particle
+                /// Inspired by RTA MC 2D    
+                auto spectrum = (*(grids[mat])).get_spectrum_at_q(particle.q);
+                auto my_omega = spectrum.omega(particle.alpha);
+                auto new_v = get_v(*(grids[mat]), particle.alpha, particle.q);
+                // Sometimes when we are with degeneracies the state to bounce is the
+                // other degenerate band - this should take care of this
+                //
+                bool good = spectrum.vg.col(particle.alpha).matrix().dot(nwall) > 0.0;
+                //
+                if (! good ) {
+                    for (std::size_t i = 0; i < spectrum.omega.size(); i++) {
+                        if (i != particle.alpha and alma::almost_equal(my_omega,spectrum.omega(i))) {
+                            if (spectrum.vg.col(i).matrix().dot(nwall) > 0.0) {
+                                particle.alpha = i;
+                                new_v = get_v(*(grids[mat]), particle.alpha, particle.q);
+                                good= true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (good){
+                    v=new_v;
+                    // Recursive call
+                    evolparticle(particle,grids,cells,v,sys,
+                        left_time,rnd,pmutex);
+                }
+                else{
+                    //set to be deleted
+                    particle.q=0;
+                    particle.alpha=0;
+                }    
+            }            
         }
         
         return;
@@ -914,9 +1109,9 @@ void evolparticle(alma::D_particle& particle,
             throw alma::geometry_error("Teleport is not allowed");
         }
         particle.pos    = rnew;
+        evolparticle(particle,grids,cells,v,sys,
+                             left_time,rnd,pmutex); 
 
-        evolparticle(particle,v,sys,
-                     left_time,rnd,pmutex);
         return;
     }
     else {
@@ -940,8 +1135,8 @@ void evolparticle(alma::D_particle& particle,
                     sys[particle.boxid].get_center() -
                     rnew;
                     particle.pos = rnew + 1.0e-6*d/d.norm();
-                    evolparticle(particle,v,sys,
-                            left_time,rnd,pmutex);
+                    evolparticle(particle,grids,cells,
+                                v,sys,left_time,rnd,pmutex);                     
                     return;
                 }
             }
@@ -957,8 +1152,8 @@ void evolparticle(alma::D_particle& particle,
             throw alma::geometry_error("Teleport is not allowed");
         }
         particle.pos = rnew;
-        evolparticle(particle,v,sys,
-                     left_time,rnd,pmutex);
+        evolparticle(particle,grids,cells,v,sys,
+                     left_time,rnd,pmutex); 
         
         return;
     }
@@ -2113,12 +2308,14 @@ int main(int argc, char** argv) {
     auto ed0   = prop0.first;
     
     global_timer.add_time("properties");
-    
-    std::cout << istep << '\t' << time << '\t' << particles.size()  << '\t';
-    for (std::size_t ibox = 0; ibox < system.size(); ibox++)
-        std::cout << ed0[ibox] << '\t' << flux0[ibox](0) << '\t' << flux0[ibox](1) << '\t';
-    std::cout << std::endl;
-    std::cout << std::flush;
+    if (istep%200 == 0) {
+        //print every 200 timesteps, i.e. every 100 ps 
+        std::cout << istep << '\t' << time << '\t' << particles.size()  << '\t';
+        for (std::size_t ibox = 0; ibox < system.size(); ibox++)
+            std::cout << ed0[ibox] << '\t' << flux0[ibox](0) << '\t' << flux0[ibox](1) << '\t';
+        std::cout << std::endl;
+        std::cout << std::flush;
+    }
     
     std::vector<std::pair<std::size_t,std::size_t>> histosizes;
     for (auto &s : system) {
@@ -2144,7 +2341,7 @@ int main(int argc, char** argv) {
                     particles[i].boxid].material;
                 auto v = get_v(*(system_grid[mat]),
                                particles[i].alpha,particles[i].q);
-                evolparticle(particles[i],v,system,dt,rng_.local(),cerberus);
+                evolparticle(particles[i],system_grid,system_cell,v,system,dt,rng_.local(),cerberus);
             }
         });
         global_timer.add_time("advection");
@@ -2175,7 +2372,7 @@ int main(int argc, char** argv) {
                 auto v = get_v(*(system_grid[mat]),
                                grad_particles[i].alpha,grad_particles[i].q);
                 auto rdt = dt * std::uniform_real_distribution<double>(0., 1.)(rng_.local());
-                evolparticle(grad_particles[i],v,system,rdt,rng_.local(),cerberus);
+                evolparticle(grad_particles[i],system_grid,system_cell,v,system,rdt,rng_.local(),cerberus);
             }
         });
         
@@ -2208,7 +2405,7 @@ int main(int argc, char** argv) {
                 auto v = get_v(*(system_grid[mat]),
                                isowall_particles[i].alpha,isowall_particles[i].q);
                 auto rdt = dt * std::uniform_real_distribution<double>(0., 1.)(rng_.local());
-                evolparticle(isowall_particles[i],v,system,rdt,rng_.local(),cerberus);
+                evolparticle(isowall_particles[i],system_grid,system_cell,v,system,rdt,rng_.local(),cerberus);
             }
         });
         
@@ -2240,7 +2437,7 @@ int main(int argc, char** argv) {
                 auto v = get_v(*(system_grid[mat]),
                                adiabatic_particles[i].alpha,adiabatic_particles[i].q);
                 auto rdt = dt * std::uniform_real_distribution<double>(0., 1.)(rng_.local());
-                evolparticle(adiabatic_particles[i],v,system,rdt,rng_.local(),cerberus);
+                evolparticle(adiabatic_particles[i],system_grid,system_cell,v,system,rdt,rng_.local(),cerberus);
             }
         });
         
@@ -2378,11 +2575,14 @@ int main(int argc, char** argv) {
         ///auto tD4 = std::chrono::high_resolution_clock::now();
         
         /// Save here the properties
-        auto frame_saving = std::bind(&saver::save_frame,&Register,
+        if (istep%200 == 0) {
+            //print every 200 timesteps, i.e. every 100 ps 
+            auto frame_saving = std::bind(&saver::save_frame,&Register,
                                       time+dt,Eeff,temperatures,H); 
-        writer.push_job(frame_saving);
+            writer.push_job(frame_saving);
         
-        global_timer.add_time("saving");
+            global_timer.add_time("saving");
+        }
         
         /*
         auto tE = std::chrono::high_resolution_clock::now();
@@ -2415,12 +2615,15 @@ int main(int argc, char** argv) {
         ///Here we print the properties:
         auto flux = prop.second;
         auto ed   = prop.first;
-        std::cout << istep << '\t' << time << '\t'<< particles.size() <<'\t';
-        for (std::size_t ibox = 0; ibox < system.size(); ibox++) {
-            std::cout << ed[ibox] << '\t' << 
-            flux[ibox](0) << '\t' << flux[ibox](1) << '\t';
+        if (istep%200 == 0) {
+            //print every 200 timesteps, i.e. every 100 ps 
+            std::cout << istep << '\t' << time << '\t'<< particles.size() <<'\t';
+            for (std::size_t ibox = 0; ibox < system.size(); ibox++) {
+                std::cout << ed[ibox] << '\t' << 
+                flux[ibox](0) << '\t' << flux[ibox](1) << '\t';
+            }
+            std::cout << std::endl;
         }
-        std::cout << std::endl;
         
     }
     
@@ -2432,6 +2635,8 @@ int main(int argc, char** argv) {
     
     return EXIT_SUCCESS;
 }
+
+
 
 
 
